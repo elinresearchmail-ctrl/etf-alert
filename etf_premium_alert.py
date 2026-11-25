@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -28,8 +29,13 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 THRESHOLD = float(os.environ.get("THRESHOLD", "1.0"))
 STEP = float(os.environ.get("STEP", "0.5"))
 EXTRA = {c.strip() for c in os.environ.get("EXTRA_CODES", "").split(",") if c.strip()}
+EXCLUDE = {c.strip() for c in os.environ.get("EXCLUDE_CODES", "").split(",") if c.strip()}
 POLL = int(os.environ.get("POLL_SECONDS", "30"))
 MODE = os.environ.get("MODE", "run")
+
+HOLDINGS_FILE = os.environ.get("HOLDINGS_FILE", "top_holdings.json")
+INVITE_CODE = os.environ.get("INVITE_CODE", "")
+SUBS_FILE = "subscribers.enc"
 
 START = (9, 0)
 END = tuple(int(x) for x in os.environ.get("END_TIME", "11:00").split(":"))  # 預設只盯開盤兩小時
@@ -72,7 +78,7 @@ def parse(data):
                 continue
             out[code] = {
                 "code": code,
-                "name": str(row.get("b", "")).strip(),
+                "name": str(row.get("b", "")).split("(")[0].split("（")[0].strip(),
                 "price": price,
                 "nav": nav,
                 # 自己算，不依賴 g 欄位
@@ -84,23 +90,133 @@ def parse(data):
 
 
 def watched(code):
+    if code in EXCLUDE:
+        return False
     return code.endswith("A") or code in EXTRA
 
 
-def send(text):
-    if not TOKEN or not CHAT_ID:
-        print("[no telegram config]\n" + text)
-        return
-    body = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
+def tg(method, payload):
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data=body,
+        f"https://api.telegram.org/bot{TOKEN}/{method}",
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+# ---------- 訂閱名單（加密存放，公開 repo 也讀不出朋友的 chat id） ----------
+def _fernet():
+    import base64, hashlib
+    from cryptography.fernet import Fernet
+    key = base64.urlsafe_b64encode(hashlib.sha256(("subs:" + TOKEN).encode()).digest())
+    return Fernet(key)
+
+
+def load_state():
+    state = {"subs": [], "offset": 0}
     try:
-        urllib.request.urlopen(req, timeout=15).read()
+        with open(SUBS_FILE, "rb") as f:
+            state = json.loads(_fernet().decrypt(f.read()).decode())
+    except FileNotFoundError:
+        pass
     except Exception as e:
-        print("telegram error:", e)
+        print("subscriber file unreadable:", e)
+    return state
+
+
+def save_state(state):
+    with open(SUBS_FILE, "wb") as f:
+        f.write(_fernet().encrypt(json.dumps(state).encode()))
+
+
+STATE = None
+
+
+def subscribers():
+    ids = set(STATE["subs"]) if STATE else set()
+    if CHAT_ID:
+        ids.add(int(CHAT_ID))  # 你自己永遠會收到
+    return ids
+
+
+def sync_subscribers():
+    """讀 bot 收到的訊息：/start 邀請碼 → 加入；/stop → 退訂。"""
+    global STATE
+    if STATE is None:
+        STATE = load_state()
+    if not TOKEN:
+        return
+    try:
+        res = tg("getUpdates", {"offset": STATE.get("offset", 0), "timeout": 0, "allowed_updates": ["message"]})
+    except Exception as e:
+        print("getUpdates error:", e)
+        return
+    for u in res.get("result", []):
+        STATE["offset"] = u["update_id"] + 1
+        msg = u.get("message") or {}
+        chat = (msg.get("chat") or {}).get("id")
+        text = (msg.get("text") or "").strip()
+        if not chat or (msg.get("chat") or {}).get("type") != "private":
+            continue
+        parts = text.split()
+        cmd = parts[0].split("@")[0] if parts else ""
+        try:
+            if cmd == "/start":
+                if chat in STATE["subs"] or (CHAT_ID and str(chat) == str(CHAT_ID)):
+                    tg("sendMessage", {"chat_id": chat, "text": "你已經在通知名單裡了 👍"})
+                elif not INVITE_CODE or (len(parts) > 1 and parts[1] == INVITE_CODE):
+                    STATE["subs"].append(chat)
+                    tg("sendMessage", {"chat_id": chat, "text":
+                        "✅ 加入成功！\n平日 09:00–11:00 主動式 ETF 折溢價超過門檻時會通知你。\n不想收了輸入 /stop"})
+                else:
+                    tg("sendMessage", {"chat_id": chat, "text": "請用朋友給你的 QR code 加入。"})
+            elif cmd == "/stop":
+                if chat in STATE["subs"]:
+                    STATE["subs"].remove(chat)
+                tg("sendMessage", {"chat_id": chat, "text": "已退訂，之後不會再收到通知。想再加入請重新掃 QR code。"})
+        except Exception as e:
+            print("reply error:", e)
+
+
+def send(text, only_owner=False):
+    if not TOKEN:
+        print("[no telegram config]\n" + text)
+        return
+    targets = {int(CHAT_ID)} if (only_owner and CHAT_ID) else subscribers()
+    for chat in targets:
+        try:
+            tg("sendMessage", {"chat_id": chat, "text": text})
+        except urllib.error.HTTPError as e:
+            if e.code == 403 and STATE and chat in STATE["subs"]:
+                STATE["subs"].remove(chat)  # 對方封鎖 bot → 自動移除
+            print("telegram error:", chat, e)
+        except Exception as e:
+            print("telegram error:", chat, e)
+        time.sleep(0.05)
+
+
+def load_holdings():
+    """讀 top_holdings.json：{"date": "20261125", "etfs": {"00991A": [["2330","台積電",15.87], ...]}}"""
+    try:
+        with open(HOLDINGS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print("holdings not loaded:", e)
+        return {}
+
+
+HOLDINGS = load_holdings()
+
+
+def holdings_lines(code, discount):
+    top = (HOLDINGS.get("etfs") or {}).get(code)
+    if not top:
+        return ""
+    d = str(HOLDINGS.get("date", ""))
+    label = "🔻 避險可賣" if discount else "🔺 避險可買"
+    rows = "\n".join(f"  {c} {n} {w:.1f}%" for c, n, w in top[:5])
+    return f"{label}（前五大，持股日 {d[4:6]}/{d[6:]}）：\n{rows}\n"
 
 
 def fmt(r):
@@ -113,6 +229,7 @@ def fmt(r):
         f"{r['code']} {r['name']}\n"
         f"💰 市價 {r['price']:.2f}｜預估淨值 {r['nav']:.2f}\n"
         f"👉 可考慮：{action}\n"
+        f"{holdings_lines(r['code'], r['prem'] < 0)}"
         f"⚠️ 持股鎖漲跌停時淨值會失真，請先確認\n"
         f"🕒 {r['time']}"
     )
@@ -127,9 +244,9 @@ def run_test():
     print(f"共 {len(rows)} 檔有報價，監控中 {len(active)} 檔")
     top = sorted(active, key=lambda r: abs(r["prem"]), reverse=True)[:5]
     lines = [f"{r['code']} {r['name']} {r['prem']:+.2f}%" for r in top]
-    send("🧪 折溢價通知測試\n資料日期 " + (top[0]["date"] if top else "無") + "\n" + "\n".join(lines))
+    send("🧪 折溢價通知測試\n資料日期 " + (top[0]["date"] if top else "無") + "\n" + "\n".join(lines), only_owner=True)
     if top:
-        send(fmt(top[0]))  # 順便測試通知格式
+        send(fmt(top[0]), only_owner=True)  # 順便測試通知格式（只發給你自己）
 
 
 def run_loop():
@@ -143,6 +260,7 @@ def run_loop():
         time.sleep(20)
 
     while now() < now().replace(hour=END[0], minute=END[1], second=0):
+        sync_subscribers()  # 盤中有人掃碼加入，馬上回覆並開始收通知
         try:
             rows = parse(fetch())
         except Exception as e:
@@ -188,8 +306,16 @@ def run_loop():
 
 
 if __name__ == "__main__":
-    if MODE == "test":
-        run_test()
-    else:
-        run_loop()
+    sync_subscribers()
+    try:
+        if MODE == "test":
+            run_test()
+        elif MODE == "sync":
+            pass  # 只處理加入/退訂
+        else:
+            run_loop()
+    finally:
+        sync_subscribers()
+        save_state(STATE)
+        print(f"subscribers: {len(STATE['subs'])}")
     sys.exit(0)
