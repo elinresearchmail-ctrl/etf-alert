@@ -2,7 +2,7 @@ name: ETF 折溢價即時通知
 
 on:
   schedule:
-    # 台北時間週一到週五 08:50 啟動（UTC 00:50），監控 09:00–11:00
+    # 台北時間週一到週五 08:50 啟動（UTC 00:50），監控整個盤中 09:00–13:30
     - cron: "50 0 * * 1-5"
     # 每小時登記一次新加入的朋友
     - cron: "17 * * * *"
@@ -22,7 +22,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,7 +39,7 @@ jobs:
           # 投資海外的主動 ETF：盤中淨值用美股估算，折價多半是時差不是套利機會
           EXCLUDE_CODES: "00402A,00986A,00983A"
           POLL_SECONDS: "30"
-          END_TIME: "11:00"
+          END_TIME: "13:30"
           MODE: ${{ github.event.inputs.mode || (github.event.schedule == '50 0 * * 1-5' && 'run' || 'sync') }}
         run: python etf_premium_alert.py
       - name: Save subscriber list
