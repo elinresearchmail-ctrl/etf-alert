@@ -2,13 +2,22 @@ name: ETF 折溢價即時通知
 
 on:
   schedule:
-    # 台北時間週一到週五 08:50 啟動（UTC 00:50），只監控 09:00–11:00
+    # 台北時間週一到週五 08:50 啟動（UTC 00:50），監控 09:00–11:00
     - cron: "50 0 * * 1-5"
+    # 每小時登記一次新加入的朋友
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "run = 盤中迴圈 / test = 抓一次資料並發測試訊息"
+        description: "run = 盤中迴圈 / test = 抓一次資料並發測試訊息 / sync = 只登記新朋友"
         default: "test"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: etf-alert
+  cancel-in-progress: false
 
 jobs:
   watch:
@@ -19,6 +28,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: pip install -q cryptography
       - name: Run
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.ARB_BOT_TOKEN }}
@@ -26,7 +36,20 @@ jobs:
           THRESHOLD: "1.0"
           STEP: "0.5"
           EXTRA_CODES: "0050,00878,0056"
+          # 投資海外的主動 ETF：盤中淨值用美股估算，折價多半是時差不是套利機會
+          EXCLUDE_CODES: "00402A,00986A,00983A"
           POLL_SECONDS: "30"
           END_TIME: "11:00"
-          MODE: ${{ github.event.inputs.mode || 'run' }}
+          MODE: ${{ github.event.inputs.mode || (github.event.schedule == '50 0 * * 1-5' && 'run' || 'sync') }}
         run: python etf_premium_alert.py
+      - name: Save subscriber list
+        if: always()
+        run: |
+          git config user.name "etf-alert-bot"
+          git config user.email "etf-alert-bot@users.noreply.github.com"
+          git add subscribers.enc
+          if ! git diff --cached --quiet; then
+            git commit -m "update subscribers"
+            git pull --rebase
+            git push
+          fi
