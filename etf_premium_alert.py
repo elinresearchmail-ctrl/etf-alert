@@ -38,7 +38,7 @@ INVITE_CODE = os.environ.get("INVITE_CODE", "")
 SUBS_FILE = "subscribers.enc"
 
 START = (9, 0)
-END = tuple(int(x) for x in os.environ.get("END_TIME", "11:00").split(":"))  # 預設只盯開盤兩小時
+END = tuple(int(x) for x in os.environ.get("END_TIME", "13:30").split(":"))  # 預設盯整個盤中
 
 
 def now():
@@ -296,13 +296,6 @@ def run_loop():
             print("no same-day data, market likely closed; exit")
             return
         time.sleep(POLL)
-
-    # 監控結束摘要
-    if day_extreme:
-        top = sorted(day_extreme.values(), key=lambda r: abs(r["prem"]), reverse=True)[:10]
-        lines = [f"{'🟢' if r['prem'] < 0 else '🔴'} {r['code']} {r['name']} {r['prem']:+.2f}%（{r['time']}）" for r in top]
-        window = f"09:00–{END[0]:02d}:{END[1]:02d}"
-        send(f"📊 {today[4:6]}/{today[6:]} {window} 主動式 ETF 最大折溢價\n" + "\n".join(lines))
 
 
 if __name__ == "__main__":
