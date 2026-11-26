@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -q pandas numpy pyyaml yfinance
+      - run: pip install -q pandas numpy pyyaml yfinance cryptography
       - name: Scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.ARB_BOT_TOKEN }}
