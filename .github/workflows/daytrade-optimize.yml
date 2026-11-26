@@ -8,8 +8,8 @@ on:
       - "sectors.yaml"
       - ".github/workflows/daytrade-optimize.yml"
   schedule:
-    # 每週日台北時間 20:07（UTC 12:07）用最新 60 天資料重新篩選
-    - cron: "7 12 * * 0"
+    # 每個交易日台北時間 14:47（UTC 06:47）收盤後，用最新 60 天資料重新篩選，隔天開盤就套用
+    - cron: "47 6 * * 1-5"
   workflow_dispatch:
 
 permissions:
