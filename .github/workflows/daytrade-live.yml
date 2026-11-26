@@ -1,0 +1,35 @@
+name: 當沖盤中訊號
+
+on:
+  schedule:
+    # 台北時間平日 08:32、08:47 啟動；09:13～12:13 每小時再檢查一次（排程漏跑會自動補上）
+    - cron: "32 0 * * 1-5"
+    - cron: "47 0 * * 1-5"
+    - cron: "13 1-4 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: daytrade-live
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q pandas numpy pyyaml yfinance cryptography
+      - name: Live
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.ARB_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ARB_CHAT_ID }}
+        run: |
+          HM=$(TZ=Asia/Taipei date +%H%M)
+          DOW=$(TZ=Asia/Taipei date +%u)
+          if [ "$DOW" -gt 5 ] || [ "$((10#$HM))" -lt 800 ] || [ "$((10#$HM))" -ge 1315 ]; then
+            echo "不在盤中時段，結束"; exit 0
+          fi
+          python daytrade.py live

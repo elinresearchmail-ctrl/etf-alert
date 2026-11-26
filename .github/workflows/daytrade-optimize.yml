@@ -1,0 +1,46 @@
+name: 當沖策略篩選
+
+on:
+  # 上傳／修改當沖程式或族群清單時，自動重新篩選
+  push:
+    paths:
+      - "daytrade.py"
+      - "sectors.yaml"
+      - ".github/workflows/daytrade-optimize.yml"
+  schedule:
+    # 每週日台北時間 20:07（UTC 12:07）用最新 60 天資料重新篩選
+    - cron: "7 12 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q pandas numpy pyyaml yfinance cryptography
+      - name: Optimize
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.ARB_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ARB_CHAT_ID }}
+        run: python daytrade.py optimize
+      - name: 儲存選出的策略
+        run: |
+          [ -f daytrade_params.json ] || exit 0
+          cp daytrade_params.json /tmp/dt.json
+          git config user.name "etf-alert-bot"
+          git config user.email "etf-alert-bot@users.noreply.github.com"
+          git fetch -q origin main
+          git reset -q --hard origin/main
+          cp /tmp/dt.json daytrade_params.json
+          git add daytrade_params.json
+          if ! git diff --cached --quiet; then
+            git commit -q -m "update daytrade params"
+            git push -q origin HEAD:main
+          fi
