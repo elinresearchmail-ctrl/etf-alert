@@ -14,6 +14,7 @@
   MODE                 run (預設，盤中迴圈) / test (抓一次資料、印出原始欄位、發一則測試訊息)
 """
 import json
+import re
 import os
 import sys
 import time
@@ -131,6 +132,7 @@ def save_state(state):
 
 
 STATE = None
+_ORIG = None
 
 
 def subscribers():
@@ -142,9 +144,10 @@ def subscribers():
 
 def sync_subscribers():
     """讀 bot 收到的訊息：/start 邀請碼 → 加入；/stop → 退訂。"""
-    global STATE
+    global STATE, _ORIG
     if STATE is None:
         STATE = load_state()
+        _ORIG = json.dumps(STATE, sort_keys=True)
     if not TOKEN:
         return
     try:
@@ -196,27 +199,182 @@ def send(text, only_owner=False):
         time.sleep(0.05)
 
 
+# ---------- 前五大持股：直接讀 Etf-line 每晚產生的 data/etf_index.json ----------
+HOLDINGS_REPO = os.environ.get("HOLDINGS_REPO", "")    # 例如 elinresearchmail-ctrl/Etf-line
+HOLDINGS_TOKEN = os.environ.get("HOLDINGS_TOKEN", "")  # 只能讀 Etf-line 的 GitHub token
+
+
+def gh_file(path):
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{HOLDINGS_REPO}/contents/{path}",
+        headers={"Authorization": f"Bearer {HOLDINGS_TOKEN}", "Accept": "application/vnd.github.raw+json",
+                 "User-Agent": "etf-alert"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def load_holdings():
-    """讀 top_holdings.json：{"date": "20261125", "etfs": {"00991A": [["2330","台積電",15.87], ...]}}"""
-    try:
-        with open(HOLDINGS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print("holdings not loaded:", e)
-        return {}
+    """回傳 {etf: {"date": "2026-11-25", "top": [[code, name, pct], ...]}}"""
+    out = {}
+    if HOLDINGS_REPO and HOLDINGS_TOKEN:
+        try:
+            idx = gh_file("data/etf_index.json")
+            per = {}
+            for code, lst in (idx.get("stocks") or {}).items():
+                for x in lst:
+                    if len(x) > 3 and x[1] and x[3]:
+                        per.setdefault(x[0], []).append([code, "", float(x[3])])
+            for t, info in (idx.get("etfs") or {}).items():
+                top = sorted(per.get(t, []), key=lambda r: -r[2])[:5]
+                if top:
+                    out[t] = {"date": info.get("date", ""), "top": top}
+            print(f"holdings loaded from {HOLDINGS_REPO}: {len(out)} ETFs")
+        except Exception as e:
+            print("holdings from repo failed:", e)
+    if not out:  # 備用：repo 裡手動放的 top_holdings.json
+        try:
+            with open(HOLDINGS_FILE, encoding="utf-8") as f:
+                j = json.load(f)
+            d = str(j.get("date", ""))
+            iso = f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d
+            out = {t: {"date": iso, "top": rows} for t, rows in (j.get("etfs") or {}).items()}
+        except Exception as e:
+            print("holdings not loaded:", e)
+    return out
 
 
 HOLDINGS = load_holdings()
+_NAMED = set()
 
 
-def holdings_lines(code, discount):
-    top = (HOLDINGS.get("etfs") or {}).get(code)
-    if not top:
+def fill_names(t):
+    """股票名稱從 Etf-line 的持股快照補上（只在要發通知時才抓）。"""
+    h = HOLDINGS.get(t)
+    if not h or t in _NAMED or not (HOLDINGS_REPO and HOLDINGS_TOKEN):
+        return
+    _NAMED.add(t)
+    try:
+        snap = gh_file(f"data/snapshots/{t}/{h['date']}.json")
+        names = {str(x.get("code", "")).strip(): x.get("name", "") for x in snap.get("holdings", [])}
+        for row in h["top"]:
+            row[1] = row[1] or names.get(row[0], "")
+    except Exception as e:
+        print("names failed:", t, e)
+
+
+# ---------- 前五大持股：開盤前直接從各投信官網抓 PCF（pcf_fetch.py，不需要任何 token） ----------
+_PCF = {}
+
+
+_PX = {}
+
+
+def close_prices():
+    """上市＋上櫃最新收盤價（zdsetf 沒給市值時，用來算持股權重）。"""
+    if _PX:
+        return _PX
+    import requests
+    try:
+        for r in requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=30).json():
+            p = num(r.get("ClosingPrice"))
+            if p:
+                _PX[str(r.get("Code", "")).strip()] = p
+    except Exception as e:
+        print("twse prices failed:", e)
+    try:
+        for r in requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes", timeout=30).json():
+            p = num(r.get("Close"))
+            if p:
+                _PX[str(r.get("SecuritiesCompanyCode", "")).strip()] = p
+    except Exception as e:
+        print("tpex prices failed:", e)
+    return _PX
+
+
+def zdsetf_top(code):
+    """zdsetf.com：鏡像富邦、台新、第一金、安聯、野村、群益、中信、國泰等官網持股。"""
+    import requests
+    r = requests.get(f"https://zdsetf.com/api/etfs/{code}/snapshot", timeout=60,
+                     headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-TW,zh;q=0.9"})
+    r.raise_for_status()
+    d = r.json()
+    raw = str(d.get("snapshot_date") or d.get("as_of_date") or d.get("date") or "")
+    m = re.search(r"(\d{2,4})[/\-.](\d{1,2})[/\-.](\d{1,2})", raw)
+    if not m:
+        raise RuntimeError("no date")
+    y, mo, dd = (int(x) for x in m.groups())
+    day = datetime(y + 1911 if y < 1911 else y, mo, dd).date()
+    day -= timedelta(days=1)  # zdsetf 用「下一交易日」標日期，往前一個平日才是持股日
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    rows = []
+    for h in d.get("holdings") or d.get("positions") or d.get("stocks") or []:
+        c = str(h.get("stock_code") or h.get("code") or h.get("ticker") or "").strip()
+        if not re.fullmatch(r"\d{4,6}[A-Z]?", c):
+            continue  # 只要股票，不要現金、期貨
+        mv = num(h.get("market_value") or h.get("market_value_ntd") or h.get("mv"))
+        sh = num(h.get("shares", h.get("share", 0))) or 0
+        rows.append([c, str(h.get("stock_name") or h.get("name") or "").strip(), mv, sh])
+    if not rows:
+        raise RuntimeError("no holdings")
+    if not all(r[2] for r in rows):  # 沒給市值：股數 × 收盤價
+        px = close_prices()
+        for r in rows:
+            r[2] = r[2] or r[3] * px.get(r[0], 0)
+    aum = num(d.get("nav_total") or d.get("aum")) or sum(r[2] for r in rows)
+    top = sorted(rows, key=lambda r: -r[2])[:5]
+    return {"date": day.isoformat(), "top": [[c, re.sub(r"\s+", "", n), mv / aum * 100] for c, n, mv, _ in top]}
+
+
+def pcf_top(code, name):
+    if code in _PCF:
+        return _PCF[code]
+    _PCF[code] = None
+    try:  # 1) 投信官網 PCF（有官方權重）
+        import pcf_fetch as P
+        issuer = next((k for k in P.ISSUER if k in name), None)
+        if issuer:
+            f = P.ISSUER[issuer]
+            short = re.sub(r"^主動", "", name)
+            date, hs, _ = f(code, short) if f is P.kgi else f(code)
+            hs = P.stock_only(hs)
+            top = sorted(hs, key=lambda h: -(h.get("weight") or 0))[:5]
+            if top:
+                _PCF[code] = {"date": date, "top": [[h["code"], re.sub(r"\s+", "", h["name"]), h["weight"]] for h in top]}
+                print(f"pcf {code} {issuer}: {len(hs)} holdings, date {date}")
+    except Exception as e:
+        print(f"pcf {code} official failed: {type(e).__name__}: {str(e)[:120]}")
+    if not _PCF[code]:
+        try:  # 2) 備用：zdsetf
+            _PCF[code] = zdsetf_top(code)
+            print(f"pcf {code} zdsetf: date {_PCF[code]['date']}")
+        except Exception as e:
+            print(f"pcf {code} zdsetf failed: {type(e).__name__}: {str(e)[:120]}")
+    return _PCF[code]
+
+
+def prefetch_holdings(rows):
+    """開盤前把所有要監控的主動 ETF 持股先抓好，盤中發通知就不用等。"""
+    for code, r in rows.items():
+        if code.endswith("A") and watched(code):
+            pcf_top(code, r["name"])
+    print(f"holdings ready: {sum(1 for v in _PCF.values() if v)}/{len(_PCF)}")
+
+
+def holdings_lines(code, discount, name=""):
+    h = _PCF.get(code)
+    if h is None and code not in _PCF and name:
+        h = pcf_top(code, name)
+    if not h:
+        fill_names(code)
+        h = HOLDINGS.get(code)
+    if not h:
         return ""
-    d = str(HOLDINGS.get("date", ""))
+    d = h["date"]
     label = "🔻 避險可賣" if discount else "🔺 避險可買"
-    rows = "\n".join(f"  {c} {n} {w:.1f}%" for c, n, w in top[:5])
-    return f"{label}（前五大，持股日 {d[4:6]}/{d[6:]}）：\n{rows}\n"
+    rows = "\n".join(f"  {c} {n} {w:.1f}%" if n else f"  {c} {w:.1f}%" for c, n, w in h["top"])
+    return f"{label}（前五大，持股日 {d[5:7]}/{d[8:10]}）：\n{rows}\n"
 
 
 def fmt(r):
@@ -229,7 +387,7 @@ def fmt(r):
         f"{r['code']} {r['name']}\n"
         f"💰 市價 {r['price']:.2f}｜預估淨值 {r['nav']:.2f}\n"
         f"👉 可考慮：{action}\n"
-        f"{holdings_lines(r['code'], r['prem'] < 0)}"
+        f"{holdings_lines(r['code'], r['prem'] < 0, r['name'])}"
         f"⚠️ 持股鎖漲跌停時淨值會失真，請先確認\n"
         f"🕒 {r['time']}"
     )
@@ -254,6 +412,11 @@ def run_loop():
     alerted = {}      # code -> 上次通知時的 |折溢價|，同方向
     day_extreme = {}  # code -> 當日最極端那筆
     fresh_seen = False
+
+    try:
+        prefetch_holdings(parse(fetch()))
+    except Exception as e:
+        print("prefetch failed:", e)
 
     # 等到開盤
     while now() < now().replace(hour=START[0], minute=START[1], second=0):
@@ -305,10 +468,17 @@ if __name__ == "__main__":
             run_test()
         elif MODE == "sync":
             pass  # 只處理加入/退訂
+        elif MODE == "auto":
+            # 排程自動判斷：平日 08:00 到收盤前啟動就進入盤中監控，其他時間只登記新朋友
+            n = now()
+            if n.weekday() < 5 and (8, 0) <= (n.hour, n.minute) < END:
+                run_loop()
         else:
             run_loop()
     finally:
         sync_subscribers()
-        save_state(STATE)
+        # 名單或讀取位置有變才存檔（加密結果每次不同，沒變就不要產生新的 commit）
+        if json.dumps(STATE, sort_keys=True) != _ORIG or not os.path.exists(SUBS_FILE):
+            save_state(STATE)
         print(f"subscribers: {len(STATE['subs'])}")
     sys.exit(0)
