@@ -1,4 +1,4 @@
-"""策略篩選：一次測試多種策略組合，留下勝率高、而且真的有賺的那一組。
+"""策略篩選：一次測試多種策略組合，多方、空方各留下勝率最高、而且真的有賺的那一組。
 
 做法（避免「只是剛好適合過去」的假象）：
   1. 抓近 3 年股價，前 2/3 當「訓練期」、後 1/3 當「驗證期」
@@ -24,7 +24,7 @@ import sector_strategy as S
 MIN_TRADES_TRAIN = int(os.environ.get("MIN_TRADES_TRAIN", "15"))
 MIN_TRADES_TEST = int(os.environ.get("MIN_TRADES_TEST", "5"))
 
-GRID = {
+LONG_GRID = {
     "MODES": [["多頭"], ["配對"], ["多頭", "配對"]],
     "LEADER_ONLY": [False, True],
     "LONG_STOP": [0.05, 0.08],
@@ -32,12 +32,20 @@ GRID = {
     "VALUE_RATIO": [1.0, 1.3],
     "SPLIT_NEAR_HIGH": [1.0, 0.97],
 }
+SHORT_GRID = {
+    "MODES": [["空頭"]],
+    "SHORT_WEAKEST_ONLY": [False, True],
+    "SHORT_STOP": [0.05, 0.08],
+    "SHORT_EXIT_MA": ["ma10", "ma20"],
+    "VALUE_RATIO_SHORT": [1.0, 1.3],
+    "BREADTH_DOWN": [0.3, 0.5],
+}
 
 
-def variants():
+def variants(grid):
     seen = set()
-    keys = list(GRID)
-    for combo in itertools.product(*GRID.values()):
+    keys = list(grid)
+    for combo in itertools.product(*grid.values()):
         v = dict(zip(keys, combo))
         if v["MODES"] == ["配對"]:  # 只做配對時，做多相關的設定沒有作用
             v.update(LEADER_ONLY=False, LONG_STOP=0.07, LONG_EXIT_MA="ma10")
@@ -63,6 +71,10 @@ def stats(trades, curve):
 def label(v):
     mode = "+".join(v["MODES"])
     bits = [mode]
+    if "空頭" in v["MODES"]:
+        return "｜".join(bits + ["只空最弱" if v["SHORT_WEAKEST_ONLY"] else "空最弱兩檔", f"停損{v['SHORT_STOP']:.0%}",
+                                 f"站回{v['SHORT_EXIT_MA'][2:]}日線補", f"{1 - v['BREADTH_DOWN']:.0%}跌破月線",
+                                 f"量能{v['VALUE_RATIO_SHORT']}x"])
     if "多頭" in v["MODES"]:
         bits += ["只買龍頭" if v["LEADER_ONLY"] else "龍頭+次強", f"停損{v['LONG_STOP']:.0%}", f"破{v['LONG_EXIT_MA'][2:]}日線出"]
     if "配對" in v["MODES"]:
@@ -85,47 +97,64 @@ def main():
     dates = p["close"].index
     base = copy.deepcopy(S.PARAMS)
 
-    results = []
-    vs = list(variants())
-    print(f"共 {len(vs)} 種組合，訓練期 {dates[61]:%Y/%m/%d}–{dates[split - 1]:%Y/%m/%d}，"
-          f"驗證期 {dates[split]:%Y/%m/%d}–{dates[-1]:%Y/%m/%d}")
-    for k, v in enumerate(vs, 1):
+    def evaluate(grid, side):
+        res = []
+        vs = list(variants(grid))
+        for k, v in enumerate(vs, 1):
+            S.PARAMS.clear()
+            S.PARAMS.update(base, **v)
+            cache = S.precompute(p, sectors)
+            tr_t, cv_t = B.run(p, sectors, 61, split, cache)
+            tr_v, cv_v = B.run(p, sectors, split, n, cache)
+            res.append({"side": side, "v": v, "train": stats(tr_t, cv_t), "test": stats(tr_v, cv_v)})
+            print(f"[{side} {k}/{len(vs)}] {label(v)}  訓練 {fmt(res[-1]['train'])}  驗證 {fmt(res[-1]['test'])}")
         S.PARAMS.clear()
-        S.PARAMS.update(base, **v)
-        cache = S.precompute(p, sectors)  # 分化期判斷會受參數影響，每組重算
-        tr_t, cv_t = B.run(p, sectors, 61, split, cache)
-        tr_v, cv_v = B.run(p, sectors, split, n, cache)
-        results.append({"v": v, "train": stats(tr_t, cv_t), "test": stats(tr_v, cv_v)})
-        print(f"[{k}/{len(vs)}] {label(v)}  訓練 {fmt(results[-1]['train'])}  驗證 {fmt(results[-1]['test'])}")
-    S.PARAMS.clear()
-    S.PARAMS.update(base)
+        S.PARAMS.update(base)
+        return res
 
-    ok = [r for r in results if r["train"]["n"] >= MIN_TRADES_TRAIN and r["train"]["exp"] > 0]
-    ok.sort(key=lambda r: (-round(r["train"]["win"], 2), -r["train"]["exp"]))
-    chosen = next((r for r in ok if r["test"]["n"] >= MIN_TRADES_TEST and r["test"]["exp"] > 0), None)
+    def pick(res):
+        ok = [r for r in res if r["train"]["n"] >= MIN_TRADES_TRAIN and r["train"]["exp"] > 0]
+        ok.sort(key=lambda r: (-round(r["train"]["win"], 2), -r["train"]["exp"]))
+        chosen = next((r for r in ok if r["test"]["n"] >= MIN_TRADES_TEST and r["test"]["exp"] > 0), None)
+        return ok, chosen
 
-    lines = [f"🧪 策略篩選（{len(vs)} 種組合）",
+    print(f"訓練期 {dates[61]:%Y/%m/%d}–{dates[split - 1]:%Y/%m/%d}，驗證期 {dates[split]:%Y/%m/%d}–{dates[-1]:%Y/%m/%d}")
+    results = evaluate(LONG_GRID, "多方") + evaluate(SHORT_GRID, "空方")
+    total = len(results)
+    lines = [f"🧪 多空策略篩選（{total} 種組合）",
              f"訓練期 {dates[61]:%Y/%m/%d}–{dates[split - 1]:%Y/%m/%d}｜驗證期 {dates[split]:%Y/%m/%d}–{dates[-1]:%Y/%m/%d}",
-             f"門檻：訓練期至少 {MIN_TRADES_TRAIN} 筆、平均每筆要賺；驗證期至少 {MIN_TRADES_TEST} 筆、也要賺", ""]
-    if not ok:
-        lines.append("❌ 沒有任何組合在訓練期同時「交易夠多」又「平均有賺」")
-    else:
-        lines.append("【訓練期勝率前 8 名】（✅＝驗證期也有賺）")
-        for r in ok[:8]:
+             f"門檻：訓練期至少 {MIN_TRADES_TRAIN} 筆、平均每筆要賺；驗證期至少 {MIN_TRADES_TEST} 筆、也要賺",
+             "已模擬：開盤漲停買不到、平盤下不得放空、跌停賣不掉"]
+    final = {}
+    chosen_any = {}
+    for side, icon in (("多方", "🐂"), ("空方", "🐻")):
+        ok, chosen = pick([r for r in results if r["side"] == side])
+        lines += ["", f"{icon}【{side}｜訓練期勝率前 5 名】（✅＝驗證期也有賺）"]
+        if not ok:
+            lines.append("❌ 沒有組合在訓練期同時「交易夠多」又「平均有賺」")
+        for r in ok[:5]:
             good = r["test"]["n"] >= MIN_TRADES_TEST and r["test"]["exp"] > 0
             lines += [f"{'✅' if good else '❌'} {label(r['v'])}",
                       f"   訓練 {fmt(r['train'])}", f"   驗證 {fmt(r['test'])}｜最大回撤 {r['test']['dd']:.1%}"]
+        if chosen:
+            lines += [f"🏆 {side}採用：{label(chosen['v'])}",
+                      f"   驗證期 {fmt(chosen['test'])}，損益 {chosen['test']['pnl']:+,.0f} 元"]
+            chosen_any[side] = chosen
+            final.update({k: v for k, v in chosen["v"].items() if k != "MODES"})
+        else:
+            lines.append(f"⚠️ {side}沒有組合通過驗證期，每日掃描不發{side}訊號")
     lines.append("")
-    if chosen:
-        lines += ["🏆 採用：" + label(chosen["v"]),
-                  f"驗證期：{fmt(chosen['test'])}，損益 {chosen['test']['pnl']:+,.0f} 元（本金 100 萬）",
-                  "從下一次每日掃描開始自動套用這組設定"]
+    if chosen_any:
+        final["MODES"] = [m for r in chosen_any.values() for m in r["v"]["MODES"]]
         out = {"updated": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M"),
-               "label": label(chosen["v"]), "params": chosen["v"], "train": chosen["train"], "test": chosen["test"]}
+               "label": "／".join(label(r["v"]) for r in chosen_any.values()), "params": final,
+               "train": {k: r["train"] for k, r in chosen_any.items()},
+               "test": {k: r["test"] for k, r in chosen_any.items()}}
         (S.ROOT / "best_params.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        lines.append("✅ 每日掃描從下一次起只發「採用」的策略訊號")
     else:
-        lines += ["⚠️ 沒有組合通過驗證期，不更換設定（勝率高但驗證期虧錢＝很可能只是剛好適合過去）"]
-    lines += ["", "提醒：勝率高不等於會賺錢，要同時看每筆平均報酬和盈虧比；回測未計入漲跌停成交不到與滑價"]
+        lines.append("⚠️ 多空都沒有組合通過驗證期，不更換設定（勝率高但驗證期虧錢＝很可能只是剛好適合過去）")
+    lines += ["", "提醒：勝率高不等於會賺錢，要同時看每筆平均報酬和盈虧比；回測未計入滑價與融券配額不足"]
     msg = "\n".join(lines)
     print(msg)
     S.send_telegram(msg)

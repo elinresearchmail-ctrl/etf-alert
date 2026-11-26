@@ -5,8 +5,9 @@
   起漲期：族群內 ≥ BREADTH_UP 比例個股站上 20 日線 → 做多龍頭＋次強（拉回 5 日線不破再轉強進場）
   分化期：龍頭收盤創 20 日新高，但站上 20 日線比例 < BREADTH_SPLIT → 多最強、空最弱（強/弱比值創 20 日新高進場）
   退潮期：龍頭跌破 20 日線 → 不做、有部位就出場
-  出場：做多跌破 10 日線或虧 7%；配對比值跌破 20 日均線或虧 5%；賺 10% 後用 5 日線移動停利；
-        10 個交易日沒賺到 3% 就出場；空方標的連 2 天漲停就回補
+  起跌期（做空）：最弱族群裡 ≥ 1-BREADTH_DOWN 比例個股跌破 20 日線 → 放空最弱股（反彈到 5 日線不過、再轉弱進場）
+  出場：做多跌破 10 日線或虧 7%；做空站回均線或虧 7%；配對比值跌破 20 日均線或虧 5%；
+        賺 10% 後用 5 日線移動停利；10 個交易日沒賺到 3% 就出場；空方標的連 2 天漲停就回補
 """
 from __future__ import annotations
 
@@ -40,10 +41,16 @@ PARAMS = {
     "TAX": 0.003,            # 賣出證交稅
     "SHORT_FEE": 0.0008,     # 融券手續費
     "LIMIT_UP": 0.095,       # 視為漲停的單日漲幅
-    "MODES": ["多頭", "配對"],  # 要做哪幾種
+    "MODES": ["多頭", "配對", "空頭"],  # 要做哪幾種
     "LEADER_ONLY": False,     # 起漲期只買龍頭（False = 龍頭＋次強）
     "LONG_EXIT_MA": "ma10",   # 做多跌破哪條均線出場（ma10 / ma20）
     "SPLIT_NEAR_HIGH": 1.0,   # 分化期：龍頭收盤 ≥ 20 日高點 × 這個值（0.97 = 離新高 3% 內）
+    # ---- 做空 ----
+    "BREADTH_DOWN": 0.3,      # 起跌期：站上 20 日線的比例 ≤ 這個（＝7 成以上跌破月線）
+    "VALUE_RATIO_SHORT": 1.3, # 做空也要量能放大（有人在倒貨）
+    "SHORT_WEAKEST_ONLY": False,  # 只空最弱一檔（False = 最弱兩檔）
+    "SHORT_STOP": 0.07,       # 做空停損（漲 7% 回補）
+    "SHORT_EXIT_MA": "ma10",  # 站回哪條均線回補
 }
 
 
@@ -106,31 +113,59 @@ def _roc_date(s) -> pd.Timestamp | None:
     return None
 
 
-def _get_json(url: str):
+def _get_text(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode("utf-8-sig"))
+        raw = r.read()
+    for enc in ("utf-8-sig", "cp950"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _get_json(url: str):
+    return json.loads(_get_text(url))
 
 
 def fetch_today_official() -> tuple[pd.Timestamp | None, dict[str, dict]]:
     """證交所＋櫃買中心官方當日行情（收盤後公布）。回傳 (資料日期, {代號: OHLCV})。"""
     rows, day = {}, None
+    # 上市：證交所「每日收盤行情（全部）」。這個網址有時回 JSON、有時回 CSV，兩種都吃；每列都有資料日期
     try:
-        for r in _get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"):
-            d = _roc_date(r.get("Date"))
-            day = day or d
-            c, o, h, l, v = (_num(r.get(k)) for k in ("ClosingPrice", "OpeningPrice", "HighestPrice", "LowestPrice", "TradeVolume"))
+        import csv
+        import io
+        t = _get_text("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json").strip()
+        if t.startswith("{"):
+            j = json.loads(t)
+            fields, data, jday = j.get("fields") or [], j.get("data") or [], _roc_date(j.get("date"))
+        else:
+            rows_ = [r for r in csv.reader(io.StringIO(t)) if r]
+            fields, data, jday = rows_[0], rows_[1:], None
+        f = {name.strip(): k for k, name in enumerate(fields)}
+        ic, io_, ih, il, iv = (f.get(n) for n in ("收盤價", "開盤價", "最高價", "最低價", "成交股數"))
+        idate, icode = f.get("日期"), f.get("證券代號", 0)
+        for r in data:
+            d = _roc_date(r[idate]) if idate is not None else jday
+            c, o, h, l = (_num(r[k]) if k is not None else None for k in (ic, io_, ih, il))
             if c and o and h and l:
-                rows[str(r.get("Code", "")).strip()] = {"open": o, "high": h, "low": l, "close": c, "volume": v or 0, "date": d}
+                rows[str(r[icode]).strip()] = {"open": o, "high": h, "low": l, "close": c,
+                                               "volume": _num(r[iv]) or 0, "date": d}
+                day = day or d
+        print(f"證交所 {day.date() if day is not None else '?'}：{len(rows)} 檔")
     except Exception as e:  # noqa: BLE001
         print("證交所當日行情失敗：", e)
+    # 上櫃：櫃買中心 OpenAPI（每筆有 Date）
     try:
+        n0 = len(rows)
         for r in _get_json("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"):
             d = _roc_date(r.get("Date"))
-            day = day or d
             c, o, h, l, v = (_num(r.get(k)) for k in ("Close", "Open", "High", "Low", "TradingShares"))
             if c and o and h and l:
                 rows[str(r.get("SecuritiesCompanyCode", "")).strip()] = {"open": o, "high": h, "low": l, "close": c, "volume": v or 0, "date": d}
+                day = day or d
+        print(f"櫃買中心：{len(rows) - n0} 檔")
     except Exception as e:  # noqa: BLE001
         print("櫃買中心當日行情失敗：", e)
     return day, rows
@@ -205,8 +240,10 @@ def sector_table(p, sectors, i: int, cache: dict | None = None) -> list[dict]:
             stage = "分化"
         else:
             stage = "整理"
+        W = order[-1]
+        short_stage = "起跌" if (c["breadth"][i] <= PARAMS["BREADTH_DOWN"] and c["cl"][i, W] < c["ma20"][i, W]) else ""
         rows.append({"sector": name, "codes": rank, "ret20": float(c["ret20"][i]), "breadth": float(c["breadth"][i]),
-                     "value_ratio": float(c["vr"][i]), "rank": rank, "stage": stage})
+                     "value_ratio": float(c["vr"][i]), "rank": rank, "stage": stage, "short_stage": short_stage})
     rows.sort(key=lambda r: -r["ret20"])
     return rows
 
@@ -254,6 +291,19 @@ def entry_signals(p, sectors, i: int, busy: set[str] | None = None, cache: dict 
             ratio = ratio_series(p, s, w)
             if i >= 21 and ratio.iloc[i] > ratio.iloc[i - 20:i].max():
                 out.append({"sector": sec["sector"], "mode": "配對", "long": [s], "short": w, "corr": corr, "info": sec})
+    if "空頭" in PARAMS["MODES"]:
+        cold = [s for s in reversed(table) if s["value_ratio"] >= PARAMS["VALUE_RATIO_SHORT"]][:PARAMS["TOP_SECTORS"]]
+        for sec in cold:
+            if sec["sector"] in busy or sec["short_stage"] != "起跌" or any(o["sector"] == sec["sector"] for o in out):
+                continue
+            legs = []
+            for c in list(reversed(sec["rank"]))[:1 if PARAMS["SHORT_WEAKEST_ONLY"] else 2]:
+                bounced = i > 0 and p["high"].iloc[i - 1][c] >= p["ma5"].iloc[i - 1][c]
+                cl = p["close"].iloc[i][c]
+                if bounced and cl <= p["ma5"].iloc[i][c] and cl < p["ma20"].iloc[i][c]:
+                    legs.append(c)
+            if legs:
+                out.append({"sector": sec["sector"], "mode": "空頭", "long": [], "short": legs, "info": sec})
     return out
 
 
@@ -263,6 +313,9 @@ def size_position(p, sig: dict, i: int, equity: float) -> dict:
     if sig["mode"] == "多頭":
         total = min(risk / PARAMS["LONG_STOP"], cap)
         return {"long": {c: total / len(sig["long"]) for c in sig["long"]}, "short": {}}
+    if sig["mode"] == "空頭":
+        total = min(risk / PARAMS["SHORT_STOP"], cap)
+        return {"long": {}, "short": {c: total / len(sig["short"]) for c in sig["short"]}}
     s, w = sig["long"][0], sig["short"]
     vs, vw = p["vol20"].iloc[i][s], p["vol20"].iloc[i][w]
     k = float(vs / vw) if vw and vs and not np.isnan(vs / vw) else 1.0
@@ -276,16 +329,36 @@ def round_trip_cost(amount_long: float, amount_short: float) -> float:
     return amount_long * (2 * f + PARAMS["TAX"]) + amount_short * (2 * f + PARAMS["TAX"] + PARAMS["SHORT_FEE"])
 
 
-def send_telegram(text: str, only_owner: bool = True):
+def subscribers(token: str, owner: str) -> list[str]:
+    """讀 etf-alert 的訂閱名單（subscribers.enc，跟折溢價通知同一份），你自己永遠在名單裡。"""
+    ids = {str(owner)} if owner else set()
+    f = ROOT / "subscribers.enc"
+    if f.exists() and token:
+        try:
+            import base64
+            import hashlib
+            from cryptography.fernet import Fernet
+            key = base64.urlsafe_b64encode(hashlib.sha256(("subs:" + token).encode()).digest())
+            ids |= {str(x) for x in json.loads(Fernet(key).decrypt(f.read_bytes()).decode()).get("subs", [])}
+        except Exception as e:  # noqa: BLE001
+            print("訂閱名單讀取失敗，只發給自己：", e)
+    return sorted(ids)
+
+
+def send_telegram(text: str, only_owner: bool = False):
+    """預設發給所有訂閱者（掃 QR code 加入的朋友＋你自己）；only_owner=True 只發給你。"""
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN", ""), os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat:
         print(text)
         return
-    for start in range(0, len(text), 3900):  # Telegram 單則上限 4096 字
-        body = json.dumps({"chat_id": chat, "text": text[start:start + 3900]}).encode()
-        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body,
-                                     headers={"Content-Type": "application/json"})
-        try:
-            urllib.request.urlopen(req, timeout=20).read()
-        except Exception as e:  # noqa: BLE001
-            print("telegram error:", e)
+    targets = [chat] if only_owner else subscribers(token, chat)
+    print(f"發送給 {len(targets)} 人")
+    for to in targets:
+        for start in range(0, len(text), 3900):  # Telegram 單則上限 4096 字
+            body = json.dumps({"chat_id": to, "text": text[start:start + 3900]}).encode()
+            req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(req, timeout=20).read()
+            except Exception as e:  # noqa: BLE001
+                print("telegram error:", to, e)
