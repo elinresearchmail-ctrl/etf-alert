@@ -1,0 +1,30 @@
+name: 族群策略回測
+
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "回測期間（1y / 2y / 3y / 5y）"
+        default: "2y"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q pandas numpy pyyaml yfinance
+      - name: Backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.ARB_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ARB_CHAT_ID }}
+          PERIOD: ${{ github.event.inputs.period || '2y' }}
+        run: python backtest.py
+      - name: 下載每筆交易明細
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: results/

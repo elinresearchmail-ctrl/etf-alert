@@ -1,0 +1,50 @@
+name: 族群策略篩選
+
+on:
+  schedule:
+    # 每月 1 號台北時間 09:37（UTC 01:37）自動重新篩選一次，跟上市場變化
+    - cron: "37 1 1 * *"
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "用多久的歷史資料（前 2/3 訓練、後 1/3 驗證）"
+        default: "3y"
+
+permissions:
+  contents: write
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q pandas numpy pyyaml yfinance
+      - name: Optimize
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.ARB_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ARB_CHAT_ID }}
+          PERIOD: ${{ github.event.inputs.period || '3y' }}
+        run: python optimize.py
+      - name: 儲存選出的設定
+        run: |
+          [ -f best_params.json ] || exit 0
+          cp best_params.json /tmp/best.json
+          git config user.name "etf-alert-bot"
+          git config user.email "etf-alert-bot@users.noreply.github.com"
+          git fetch -q origin main
+          git reset -q --hard origin/main
+          cp /tmp/best.json best_params.json
+          git add best_params.json
+          if ! git diff --cached --quiet; then
+            git commit -q -m "update best strategy params"
+            git push -q origin HEAD:main
+          fi
+      - name: 下載每種組合的結果
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimize-results
+          path: results/
