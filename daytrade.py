@@ -29,7 +29,7 @@ import pandas as pd
 import sector_strategy as S
 
 TPE = timezone(timedelta(hours=8))
-FEE = 0.001425 * float(os.environ.get("FEE_DISCOUNT", "1.0"))
+FEE = 0.001425 * float(os.environ.get("FEE_DISCOUNT", "0.2"))  # 手續費 2 折
 DAYTRADE_TAX = 0.0015
 COST = 2 * FEE + DAYTRADE_TAX          # 來回成本（佔成交金額）
 EXIT_HHMM = (13, 15)                    # 強制平倉時間
@@ -275,6 +275,12 @@ def optimize():
         ok.sort(key=lambda r: (-round(r["train"]["win"], 2), -r["train"]["exp"]))
         best = next((r for r in ok if r["test"]["n"] >= min_test and r["test"]["exp"] > 0), None)
         lines += ["", f"【{NAMES[strat]}】{len(rows)} 組，訓練期過關 {len(ok)} 組"]
+        if not ok:  # 沒過關也列出最接近的 3 組，看是筆數不夠還是虧錢
+            near = sorted(rows, key=lambda r: -r["train"]["exp"] if r["train"]["n"] else 9)[:3]
+            lines.append("最接近的組合（未過關）：")
+            for r in near:
+                why = "筆數不足" if r["train"]["n"] < min_train else "扣成本後虧損"
+                lines += [f"✖ {label(strat, r['prm'])}（{why}）", f"   訓練 {fmt(r['train'])}", f"   驗證 {fmt(r['test'])}"]
         for r in ok[:3]:
             good = r["test"]["n"] >= min_test and r["test"]["exp"] > 0
             lines += [f"{'✅' if good else '❌'} {label(strat, r['prm'])}", f"   訓練 {fmt(r['train'])}", f"   驗證 {fmt(r['test'])}"]
