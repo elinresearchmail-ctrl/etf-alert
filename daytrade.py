@@ -9,7 +9,7 @@
         站上當日高點停損，回到昨收停利
 成本：手續費 0.1425% × 2（可設折扣）＋ 當沖證交稅 0.15%
 
-  python daytrade.py optimize   # 用 Yahoo 近 60 天 5 分 K 回測所有參數組合，存 daytrade_params.json，報告發 Telegram
+  python daytrade.py optimize   # 用 Yahoo 近 60 天 5 分 K 回測所有參數組合，存 daytrade_params.json（每個交易日收盤後自動重跑）
   python daytrade.py live       # 盤中每 10 秒抓證交所即時報價，只發通過篩選的策略訊號
 """
 from __future__ import annotations
@@ -33,6 +33,12 @@ FEE = 0.001425 * float(os.environ.get("FEE_DISCOUNT", "1.0"))
 DAYTRADE_TAX = 0.0015
 COST = 2 * FEE + DAYTRADE_TAX          # 來回成本（佔成交金額）
 EXIT_HHMM = (13, 15)                    # 強制平倉時間
+MAX_STOP = 0.045                        # 停損上限 4.5%
+
+
+def cap_stop(entry: float, stop: float, side: int) -> float:
+    """停損距離最多 4.5%。"""
+    return max(stop, entry * (1 - MAX_STOP)) if side == 1 else min(stop, entry * (1 + MAX_STOP))
 PARAMS_FILE = S.ROOT / "daytrade_params.json"
 
 GRIDS = {
@@ -123,6 +129,7 @@ def simulate_day(strategy: str, prm: dict, arr: tuple, prev_close: float, tag: s
         if k >= exit_i:
             return None
         entry = o[k]
+        stop = cap_stop(entry, stop, side)
         peak = entry
         for j in range(k, exit_i + 1):
             if side == 1:
@@ -276,6 +283,13 @@ def optimize():
             lines.append(f"🏆 採用：{label(strat, best['prm'])}")
         else:
             lines.append("⚠️ 沒有組合通過驗證，盤中不發這套策略的訊號")
+    old = {}
+    if PARAMS_FILE.exists():
+        try:
+            old = {k: v["label"] for k, v in json.loads(PARAMS_FILE.read_text(encoding="utf-8")).get("strategies", {}).items()}
+        except Exception:  # noqa: BLE001
+            pass
+    new = {k: label(k, v["prm"]) for k, v in chosen.items()}
     out = {"updated": datetime.now(TPE).strftime("%Y-%m-%d %H:%M"),
            "strategies": {k: {"params": v["prm"], "label": label(k, v["prm"]), "train": v["train"], "test": v["test"]}
                           for k, v in chosen.items()}}
@@ -284,7 +298,11 @@ def optimize():
               "提醒：只有 60 天資料、樣本少；未計入滑價與當沖資格限制。僅為規則篩選，不構成投資建議"]
     msg = "\n".join(lines)
     print(msg)
-    S.send_telegram(msg)
+    scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+    if new != old or not scheduled:
+        S.send_telegram(("🔄 當沖策略依最近行情更新\n" if new != old and old else "") + msg)  # 有變才發給所有人
+    else:
+        S.send_telegram(f"⚡ 當沖策略今日重新篩選：沿用 {'、'.join(NAMES[k] for k in new) or '無'}（設定不變）", only_owner=True)
     (S.ROOT / "results").mkdir(exist_ok=True)
     (S.ROOT / "results" / "daytrade_optimize.json").write_text(
         json.dumps(all_res, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
@@ -401,6 +419,7 @@ class Live:
 
     def open(self, strat, c, side, price, stop, target, send, name, note=""):
         self.done.add((strat, c))
+        stop = cap_stop(price, stop, side)
         self.pos[(strat, c)] = {"side": side, "entry": price, "stop": stop, "target": target, "peak": price,
                                 "name": name, "trail": strat == "LEAD" and self.enabled["LEAD"]["exit"] != "vwap"}
         arrow = "🟥 做多" if side == 1 else "🟩 放空"

@@ -27,7 +27,7 @@ MIN_TRADES_TEST = int(os.environ.get("MIN_TRADES_TEST", "5"))
 LONG_GRID = {
     "MODES": [["多頭"], ["配對"], ["多頭", "配對"]],
     "LEADER_ONLY": [False, True],
-    "LONG_STOP": [0.05, 0.08],
+    "LONG_STOP": [0.03, 0.045, "atr1.5", "atr2"],  # 停損上限 4.5%
     "LONG_EXIT_MA": ["ma10", "ma20"],
     "VALUE_RATIO": [1.0, 1.3],
     "SPLIT_NEAR_HIGH": [1.0, 0.97],
@@ -35,7 +35,7 @@ LONG_GRID = {
 SHORT_GRID = {
     "MODES": [["空頭"]],
     "SHORT_WEAKEST_ONLY": [False, True],
-    "SHORT_STOP": [0.05, 0.08],
+    "SHORT_STOP": [0.03, 0.045, "atr1.5", "atr2"],
     "SHORT_EXIT_MA": ["ma10", "ma20"],
     "VALUE_RATIO_SHORT": [1.0, 1.3],
     "BREADTH_DOWN": [0.3, 0.5],
@@ -48,7 +48,7 @@ def variants(grid):
     for combo in itertools.product(*grid.values()):
         v = dict(zip(keys, combo))
         if v["MODES"] == ["配對"]:  # 只做配對時，做多相關的設定沒有作用
-            v.update(LEADER_ONLY=False, LONG_STOP=0.07, LONG_EXIT_MA="ma10")
+            v.update(LEADER_ONLY=False, LONG_STOP=0.045, LONG_EXIT_MA="ma10")
         if v["MODES"] == ["多頭"]:  # 只做多時，分化期設定沒有作用
             v["SPLIT_NEAR_HIGH"] = 1.0
         k = json.dumps(v, ensure_ascii=False, sort_keys=True)
@@ -68,15 +68,19 @@ def stats(trades, curve):
             "dd": float((curve / curve.cummax() - 1).min()) if len(curve) else 0.0}
 
 
+def stop_txt(x):
+    return f"停損{x[3:]}倍ATR(≤4.5%)" if isinstance(x, str) else f"停損{x:.1%}"
+
+
 def label(v):
     mode = "+".join(v["MODES"])
     bits = [mode]
     if "空頭" in v["MODES"]:
-        return "｜".join(bits + ["只空最弱" if v["SHORT_WEAKEST_ONLY"] else "空最弱兩檔", f"停損{v['SHORT_STOP']:.0%}",
+        return "｜".join(bits + ["只空最弱" if v["SHORT_WEAKEST_ONLY"] else "空最弱兩檔", stop_txt(v["SHORT_STOP"]),
                                  f"站回{v['SHORT_EXIT_MA'][2:]}日線補", f"{1 - v['BREADTH_DOWN']:.0%}跌破月線",
                                  f"量能{v['VALUE_RATIO_SHORT']}x"])
     if "多頭" in v["MODES"]:
-        bits += ["只買龍頭" if v["LEADER_ONLY"] else "龍頭+次強", f"停損{v['LONG_STOP']:.0%}", f"破{v['LONG_EXIT_MA'][2:]}日線出"]
+        bits += ["只買龍頭" if v["LEADER_ONLY"] else "龍頭+次強", stop_txt(v["LONG_STOP"]), f"破{v['LONG_EXIT_MA'][2:]}日線出"]
     if "配對" in v["MODES"]:
         bits.append("離新高3%內" if v["SPLIT_NEAR_HIGH"] < 1 else "龍頭創新高")
     bits.append(f"量能{v['VALUE_RATIO']}x")

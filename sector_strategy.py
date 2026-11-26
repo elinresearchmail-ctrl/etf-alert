@@ -6,7 +6,7 @@
   分化期：龍頭收盤創 20 日新高，但站上 20 日線比例 < BREADTH_SPLIT → 多最強、空最弱（強/弱比值創 20 日新高進場）
   退潮期：龍頭跌破 20 日線 → 不做、有部位就出場
   起跌期（做空）：最弱族群裡 ≥ 1-BREADTH_DOWN 比例個股跌破 20 日線 → 放空最弱股（反彈到 5 日線不過、再轉弱進場）
-  出場：做多跌破 10 日線或虧 7%；做空站回均線或虧 7%；配對比值跌破 20 日均線或虧 5%；
+  出場：做多跌破 10 日線或虧 4.5%；做空站回均線或虧 4.5%（停損可依波動調整，上限 4.5%）；配對比值跌破 20 日均線或虧 5%；
         賺 10% 後用 5 日線移動停利；10 個交易日沒賺到 3% 就出場；空方標的連 2 天漲停就回補
 """
 from __future__ import annotations
@@ -28,8 +28,8 @@ PARAMS = {
     "BREADTH_UP": 0.7,       # 起漲期：站上 20 日線的比例
     "BREADTH_SPLIT": 0.5,    # 分化期：站上 20 日線的比例低於這個
     "MIN_CORR": 0.6,         # 配對兩檔近 60 日報酬相關係數下限
-    "LONG_STOP": 0.07,       # 做多停損 7%
-    "PAIR_STOP": 0.05,       # 配對停損 5%（以多方金額計）
+    "LONG_STOP": 0.045,      # 做多停損 4.5%（也可設 "atr1.5"、"atr2"：依近期波動自動調整，上限 4.5%）
+    "PAIR_STOP": 0.045,      # 配對停損 4.5%（以多方金額計）
     "TRAIL_TRIGGER": 0.10,   # 賺 10% 後改用 5 日線移動停利
     "TIME_STOP_DAYS": 10,    # 時間停損天數
     "TIME_STOP_MIN": 0.03,   # 時間到還沒賺到 3% 就出場
@@ -49,7 +49,7 @@ PARAMS = {
     "BREADTH_DOWN": 0.3,      # 起跌期：站上 20 日線的比例 ≤ 這個（＝7 成以上跌破月線）
     "VALUE_RATIO_SHORT": 1.3, # 做空也要量能放大（有人在倒貨）
     "SHORT_WEAKEST_ONLY": False,  # 只空最弱一檔（False = 最弱兩檔）
-    "SHORT_STOP": 0.07,       # 做空停損（漲 7% 回補）
+    "SHORT_STOP": 0.045,      # 做空停損（漲 4.5% 回補；也可設 "atr1.5"、"atr2"，上限 4.5%）
     "SHORT_EXIT_MA": "ma10",  # 站回哪條均線回補
 }
 
@@ -199,7 +199,24 @@ def build_panel(hist: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     p["high20"] = close.rolling(20).max()
     p["vol20"] = p["ret1"].rolling(20).std()
     p["value"] = (close * p["volume"]).fillna(0)
+    prev = close.shift(1)
+    tr = pd.concat([(p["high"] - p["low"]), (p["high"] - prev).abs(), (p["low"] - prev).abs()]).groupby(level=0).max()
+    p["atr"] = (tr.reindex(close.index).rolling(14).mean() / close)  # 近 14 天平均真實波幅（佔股價 %）
     return p
+
+
+MAX_STOP = 0.045  # 停損上限 4.5%（跌停才 10%，停損不放太寬）
+
+
+def stop_pct(p, c: str, i: int, key: str) -> float:
+    """停損幅度。PARAMS[key] 可以是固定比例（0.05）或 "atr2"／"atr3"（近 14 天平均波動的 2／3 倍，震盪大就放寬）。"""
+    v = PARAMS[key]
+    if isinstance(v, str) and v.startswith("atr"):
+        a = p["atr"].iloc[i].get(c, np.nan)
+        if a is None or np.isnan(a):
+            return 0.07
+        return float(min(max(a * float(v[3:]), 0.02), MAX_STOP))
+    return float(min(float(v), MAX_STOP))
 
 
 def precompute(p, sectors) -> dict:
@@ -311,16 +328,16 @@ def size_position(p, sig: dict, i: int, equity: float) -> dict:
     """依風險 1%、族群上限 20%、波動度配金額。回傳各腳金額（元）。"""
     risk, cap = PARAMS["RISK_PER_TRADE"] * equity, PARAMS["SECTOR_CAP"] * equity
     if sig["mode"] == "多頭":
-        total = min(risk / PARAMS["LONG_STOP"], cap)
-        return {"long": {c: total / len(sig["long"]) for c in sig["long"]}, "short": {}}
+        per = cap / len(sig["long"])
+        return {"long": {c: min(risk / len(sig["long"]) / stop_pct(p, c, i, "LONG_STOP"), per) for c in sig["long"]}, "short": {}}
     if sig["mode"] == "空頭":
-        total = min(risk / PARAMS["SHORT_STOP"], cap)
-        return {"long": {}, "short": {c: total / len(sig["short"]) for c in sig["short"]}}
+        per = cap / len(sig["short"])
+        return {"long": {}, "short": {c: min(risk / len(sig["short"]) / stop_pct(p, c, i, "SHORT_STOP"), per) for c in sig["short"]}}
     s, w = sig["long"][0], sig["short"]
     vs, vw = p["vol20"].iloc[i][s], p["vol20"].iloc[i][w]
     k = float(vs / vw) if vw and vs and not np.isnan(vs / vw) else 1.0
     k = min(max(k, 0.5), 2.0)  # 空方金額 = 多方 × 波動比
-    amt_s = min(risk / PARAMS["PAIR_STOP"], cap / (1 + k))
+    amt_s = min(risk / min(PARAMS["PAIR_STOP"], MAX_STOP), cap / (1 + k))
     return {"long": {s: amt_s}, "short": {w: amt_s * k}}
 
 

@@ -4,6 +4,7 @@
   - 開盤就漲停：買不到，放棄進場
   - 融券「平盤以下不得放空」：開盤低於前一天收盤，放棄放空
   - 開盤跌停賣不掉、開盤漲停回補不了：出場延到下一個交易日
+  - 多頭、空頭用停損單：盤中碰到停損價就出場；開盤直接跳空穿過停損，以開盤價成交
 用固定本金 100 萬計算部位（不複利），結果推到 Telegram，並把每筆交易存成 results/trades.csv。
   python backtest.py            # 預設回測近 2 年
   PERIOD=3y python backtest.py
@@ -74,7 +75,7 @@ def should_exit(pos, p, i, sec_now):
             return "族群退潮"
         c = next(iter(pos["long"]))
         close = p["close"].iloc[i][c]
-        if ret <= -P["LONG_STOP"]:
+        if ret <= -pos["stop"]:
             return "停損"
         if close < p[P["LONG_EXIT_MA"]].iloc[i][c]:
             return "跌破均線"
@@ -85,7 +86,7 @@ def should_exit(pos, p, i, sec_now):
             return "族群轉強"
         c = next(iter(pos["short"]))
         close = p["close"].iloc[i][c]
-        if ret <= -P["SHORT_STOP"]:
+        if ret <= -pos["stop"]:
             return "停損"
         if close > p[P["SHORT_EXIT_MA"]].iloc[i][c]:
             return "站回均線"
@@ -99,7 +100,7 @@ def should_exit(pos, p, i, sec_now):
             return "族群退潮"
         s, w = next(iter(pos["long"])), next(iter(pos["short"]))
         ratio = S.ratio_series(p, s, w)
-        if ret <= -P["PAIR_STOP"]:
+        if ret <= -pos["stop"]:
             return "停損"
         if ratio.iloc[i] < ratio.iloc[i - 19:i + 1].mean():
             return "比值跌破20日均"
@@ -157,10 +158,39 @@ def run(p, sectors, start: int = 61, end: int | None = None, cache: dict | None 
                 entry = {c: px(p, "open", i, c) for c in list(lg) + list(sh)}
                 if any(np.isnan(v) or v <= 0 for v in entry.values()):
                     continue
+                key = next(iter(lg or sh))
+                stop = (S.stop_pct(p, key, i - 1, "LONG_STOP") if sig["mode"] == "多頭" else
+                        S.stop_pct(p, key, i - 1, "SHORT_STOP") if sig["mode"] == "空頭" else min(S.PARAMS["PAIR_STOP"], S.MAX_STOP))
                 open_pos.append({"sector": sig["sector"], "mode": sig["mode"], "long": lg, "short": sh,
-                                 "entry": entry, "entry_i": i, "peak": 0.0})
+                                 "entry": entry, "entry_i": i, "peak": 0.0, "stop": stop})
             busy.add(sig["sector"])
         pending_entries = []
+
+        # 1b) 盤中停損（掛停損單）：碰到停損價就出場；開盤就跳空穿過停損，以開盤價出場
+        exiting_now = {id(q) for q, _ in pending_exits}
+        for pos in list(open_pos):
+            if pos["mode"] == "配對" or id(pos) in exiting_now:
+                continue
+            c = next(iter(pos["long"] or pos["short"]))
+            e = pos["entry"][c]
+            if pos["mode"] == "多頭":
+                stop_px = e * (1 - pos["stop"])
+                if px(p, "low", i, c) > stop_px:
+                    continue
+                fill = min(px(p, "open", i, c), stop_px) if pos["entry_i"] < i else stop_px
+            else:
+                stop_px = e * (1 + pos["stop"])
+                if px(p, "high", i, c) < stop_px:
+                    continue
+                fill = max(px(p, "open", i, c), stop_px) if pos["entry_i"] < i else stop_px
+            amt = sum(pos["long"].values()) or sum(pos["short"].values())
+            gross = amt * ((fill / e - 1) if pos["mode"] == "多頭" else -(fill / e - 1))
+            net = gross - S.round_trip_cost(sum(pos["long"].values()), sum(pos["short"].values()))
+            realized += net
+            open_pos.remove(pos)
+            trades.append({"族群": pos["sector"], "模式": pos["mode"], "多": "/".join(pos["long"]), "空": "/".join(pos["short"]),
+                           "進場": dates[pos["entry_i"]].date(), "出場": dates[i].date(), "天數": i - pos["entry_i"],
+                           "報酬率": net / amt, "損益": net, "出場原因": "停損單" if fill == stop_px else "跳空停損"})
 
         # 2) 收盤：記錄權益、檢查出場、產生新訊號
         unreal = sum(pos_pnl(q, p, i) for q in open_pos)

@@ -84,14 +84,14 @@ def main():
                 cl = p["close"].iloc[i][c]
                 ma = S.PARAMS["SHORT_EXIT_MA"]
                 lines.append(f"  空 {nm(c)} 收 {cl:.2f}｜部位約總資金 {size['short'][c]:.0%}"
-                             f"｜停損 {cl * (1 + S.PARAMS['SHORT_STOP']):.2f} 或站回{ma[2:]}日線 {p[ma].iloc[i][c]:.2f}")
+                             f"｜停損 {cl * (1 + S.stop_pct(p, c, i, 'SHORT_STOP')):.2f} 或站回{ma[2:]}日線 {p[ma].iloc[i][c]:.2f}")
             lines.append("  ⚠️ 融券平盤以下不得放空：開盤低於今天收盤就不要追空")
         elif sig["mode"] == "多頭":
             lines.append(f"🚀 {sig['sector']}｜一起做多")
             for c in sig["long"]:
                 cl = p["close"].iloc[i][c]
                 lines.append(f"  多 {nm(c)} 收 {cl:.2f}｜部位約總資金 {size['long'][c]:.0%}"
-                             f"｜停損 {cl * (1 - S.PARAMS['LONG_STOP']):.2f} 或跌破{S.PARAMS['LONG_EXIT_MA'][2:]}日線 {p[S.PARAMS['LONG_EXIT_MA']].iloc[i][c]:.2f}")
+                             f"｜停損 {cl * (1 - S.stop_pct(p, c, i, 'LONG_STOP')):.2f} 或跌破{S.PARAMS['LONG_EXIT_MA'][2:]}日線 {p[S.PARAMS['LONG_EXIT_MA']].iloc[i][c]:.2f}")
         else:
             s, w = sig["long"][0], sig["short"]
             lines.append(f"🔀 {sig['sector']}｜多強空弱（近60日相關 {sig['corr']:.2f}）")
