@@ -5,8 +5,8 @@
         停損在區間中線（或另一端），停利 = 停損距離 × R 倍
   LEAD  強勢族群龍頭追價：前一天族群判定「起漲」的龍頭，盤中站上 VWAP 且創當日新高就做多；
         跌破 VWAP（或從進場價回落 X%）出場
-  FADE  弱勢股開高走低放空：前一天族群判定「起跌」的個股，開盤跳空上漲 ≥ G%，之後跌破開盤價且在 VWAP 之下就放空；
-        站上當日高點停損，回到昨收停利
+  FADE  紅盤衝高回落放空（現股當沖先賣）：開盤跳空或盤中漲幅 ≥ G%，之後跌破 VWAP（跳空型另要跌破開盤價），
+        但股價仍在平盤以上（紅盤）才放空；可選只限前一天「起跌」族群；站上當日高點停損，回到昨收或 2R 停利
 成本：手續費 0.1425% × 2（可設折扣）＋ 當沖證交稅 0.15%
 
   python daytrade.py optimize   # 用 Yahoo 近 60 天 5 分 K 回測所有參數組合，存 daytrade_params.json（每個交易日收盤後自動重跑）
@@ -45,9 +45,10 @@ GRIDS = {
     "ORB": {"range_min": [15, 30], "vol_mult": [1.0, 1.5], "target_r": [1.5, 2.0, 3.0],
             "stop": ["mid", "edge"], "side": ["long", "both"], "min_width": [0.005, 0.01]},
     "LEAD": {"start": ["09:30", "10:00"], "exit": ["vwap", "trail1.5"], "need_hot": [True, False]},
-    "FADE": {"gap": [0.02, 0.03], "start": ["09:05", "09:15"], "target": ["prevclose", "r2"]},
+    "FADE": {"gap": [0.02, 0.03, 0.05], "trigger": ["gap", "rise"], "only_weak": [True, False],
+             "start": ["09:05", "09:15"], "target": ["prevclose", "r2"]},
 }
-NAMES = {"ORB": "開盤區間突破", "LEAD": "強勢龍頭追價", "FADE": "弱勢開高走低放空"}
+NAMES = {"ORB": "開盤區間突破", "LEAD": "強勢龍頭追價", "FADE": "紅盤衝高回落放空"}
 
 
 # ---------------------------------------------------------------- 資料
@@ -188,19 +189,25 @@ def simulate_day(strategy: str, prm: dict, arr: tuple, prev_close: float, tag: s
         return None
 
     if strategy == "FADE":
-        if tag != "weak" or o[0] < prev_close * (1 + prm["gap"]):
+        if prm["only_weak"] and tag != "weak":
+            return None
+        trig = prev_close * (1 + prm["gap"])
+        if prm["trigger"] == "gap" and o[0] < trig:
             return None
         st = _hm(prm["start"])
         for k in range(1, exit_i):
             if t[k] < st:
                 continue
-            if c[k] < o[0] and c[k] < vwap[k]:
+            if prm["trigger"] == "rise" and hmax[k] < trig:
+                continue  # 盤中還沒漲到門檻
+            below_open = c[k] < o[0] if prm["trigger"] == "gap" else True
+            if below_open and c[k] < vwap[k]:
                 if k + 1 >= len(o) or o[k + 1] < prev_close:
-                    return None  # 已跌到平盤下，不追空
+                    return None  # 已經跌回平盤下，不追空
                 stop = hmax[k] * 1.002
                 entry = o[k + 1]
                 target = prev_close if prm["target"] == "prevclose" else entry - 2 * (stop - entry)
-                return run_trade(k + 1, -1, stop, target)
+                return run_trade(k + 1, -1, stop, max(target, prev_close) if prm["target"] == "prevclose" else target)
         return None
     return None
 
@@ -240,7 +247,8 @@ def label(strategy, prm):
                 f"｜{'只做多' if prm['side'] == 'long' else '多空'}｜區間≥{prm['min_width']:.1%}")
     if strategy == "LEAD":
         return f"{prm['start']}後｜{'破VWAP出' if prm['exit'] == 'vwap' else '回落1.5%出'}｜{'只限量能放大族群' if prm['need_hot'] else '不限量能'}"
-    return f"跳空≥{prm['gap']:.0%}｜{prm['start']}後｜停利{'回昨收' if prm['target'] == 'prevclose' else '2R'}"
+    return (f"{'開盤跳空' if prm['trigger'] == 'gap' else '盤中漲'}≥{prm['gap']:.0%}｜{'只限起跌族群' if prm['only_weak'] else '不限族群'}"
+            f"｜{prm['start']}後｜停利{'回昨收' if prm['target'] == 'prevclose' else '2R'}")
 
 
 def optimize():
@@ -415,13 +423,16 @@ class Live:
                     stop = s["vwap"] * 0.99 if prm["exit"] == "vwap" else s["price"] * 0.97
                     self.open("LEAD", c, 1, s["price"], stop, None, send, name,
                               note="跌破 VWAP 出場" if prm["exit"] == "vwap" else "從高點回落 1.5% 出場")
-            # ---- FADE
+            # ---- FADE（紅盤空：現股當沖先賣）
             prm = self.enabled.get("FADE")
-            if prm and ("FADE", c) not in self.done and tag == "weak" and s["open"] >= s["prev"] * (1 + prm["gap"]):
-                if hm >= _hm(prm["start"]) and bar["close"] < s["open"] and bar["close"] < s["vwap"] and s["price"] >= s["prev"]:
+            if prm and ("FADE", c) not in self.done and (tag == "weak" or not prm["only_weak"]):
+                trig = s["prev"] * (1 + prm["gap"])
+                hit = s["open"] >= trig if prm["trigger"] == "gap" else s["high"] >= trig
+                below_open = bar["close"] < s["open"] if prm["trigger"] == "gap" else True
+                if hit and hm >= _hm(prm["start"]) and below_open and bar["close"] < s["vwap"] and s["price"] >= s["prev"]:
                     stop = s["high"] * 1.002
                     target = s["prev"] if prm["target"] == "prevclose" else s["price"] - 2 * (stop - s["price"])
-                    self.open("FADE", c, -1, s["price"], stop, target, send, name)
+                    self.open("FADE", c, -1, s["price"], stop, target, send, name, note="紅盤現股當沖先賣")
 
     def open(self, strat, c, side, price, stop, target, send, name, note=""):
         self.done.add((strat, c))
